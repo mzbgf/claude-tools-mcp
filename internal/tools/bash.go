@@ -321,10 +321,14 @@ type BashInput struct {
 	Timeout         int64  `json:"timeout,omitempty" jsonschema:"Optional timeout in milliseconds (max 600000)"`
 }
 
+// BashResult is the layered result returned in structuredContent. The text
+// content (merged stdout+stderr) and this object are semantically equivalent
+// presentations of the same information, per the MCP spec (SEP-1624): clients
+// pick one - `content` for readability/token efficiency, `structuredContent`
+// for programmatic access - and MUST NOT forward both to the model.
 type BashResult struct {
-	Result   string `json:"result"`           // combined stdout + stderr (backward compatible)
-	Stdout   string `json:"stdout,omitempty"` // layered: raw stdout, never filtered
-	Stderr   string `json:"stderr,omitempty"` // layered: stderr with wrapper artifacts removed
+	Stdout   string `json:"stdout,omitempty"` // raw stdout, never filtered
+	Stderr   string `json:"stderr,omitempty"` // stderr with wrapper artifacts removed
 	ExitCode int    `json:"exit_code"`        // exit code (0 on success)
 }
 
@@ -336,7 +340,6 @@ func Bash(ctx context.Context, req *sdk.CallToolRequest, args BashInput) (*sdk.C
 	}
 
 	output := &BashResult{
-		Result:   outcome.merged,
 		Stdout:   outcome.stdout,
 		Stderr:   outcome.stderr,
 		ExitCode: outcome.exitCode,
