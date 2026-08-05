@@ -1,4 +1,4 @@
-module github.com/mathematic-inc/claude-tools-mcp
+module github.com/mzbgf/claude-tools-mcp
 
 go 1.25.1
 
