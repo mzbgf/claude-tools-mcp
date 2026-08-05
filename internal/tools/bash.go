@@ -59,14 +59,29 @@ func (s *State) executeBashCommand(ctx context.Context, command, description str
 	// Background commands don't use context timeout because they run asynchronously
 	// and their output is retrieved later via BashOutput. Foreground commands use
 	// context timeout to enforce synchronous execution limits.
+	//
+	// We spawn `bash -lic` instead of plain `bash -c`: -l (login) reads
+	// /etc/profile + ~/.profile, -i (interactive) reads /etc/bash.bashrc +
+	// ~/.bashrc, so the child gets the user's FULL shell environment (PATH
+	// extensions, aliases, functions, nvm/conda/venv hooks, etc.) instead of
+	// the bare inherited env. `-c` keeps one-shot semantics with a proper exit
+	// code. Without a PTY this prints two harmless job-control warnings to
+	// stderr which we filter in executeForeground. Stdin is left nil (Go's
+	// exec treats nil Stdin as /dev/null) so the interactive shell never reads
+	// from our JSON-RPC pipe.
 	var cmd *exec.Cmd
 	if runInBackground {
-		cmd = exec.Command("bash", "-c", command)
+		cmd = exec.Command("bash", "-lic", command)
 	} else {
 		cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 		defer cancel()
-		cmd = exec.CommandContext(cmdCtx, "bash", "-c", command)
+		cmd = exec.CommandContext(cmdCtx, "bash", "-lic", command)
+		// On timeout, kill the whole process group (bash + any grandchildren),
+		// not just bash itself. Requires Setpgid (see proc_unix.go).
+		cmd.Cancel = func() error { return killProcessTree(cmd) }
+		cmd.WaitDelay = 5 * time.Second
 	}
+	setupProcessGroup(cmd)
 
 	if wd, err := os.Getwd(); err == nil {
 		cmd.Dir = wd
@@ -80,6 +95,7 @@ func (s *State) executeBashCommand(ctx context.Context, command, description str
 
 func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command string) (string, error) {
 	output, err := cmd.CombinedOutput()
+	filtered := filterJobControlNoise(string(output))
 	if err != nil {
 		if strings.Contains(err.Error(), "context deadline exceeded") {
 			return "", fmt.Errorf("Command timed out. Consider increasing the timeout parameter or running in background.")
@@ -96,7 +112,7 @@ func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command st
 			return "", fmt.Errorf(
 				"Command exited with code %d:\n%s\n\nCommand: %s",
 				exitCode,
-				string(output),
+				filtered,
 				command,
 			)
 		}
@@ -104,12 +120,36 @@ func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command st
 		return "", fmt.Errorf("Failed to execute command: %s\n\nCommand: %s", err, command)
 	}
 
-	result := string(output)
+	result := filtered
 	if err := checkOutputSize(ctx, result, "bash"); err != nil {
 		return "", err
 	}
 
 	return result, nil
+}
+
+// filterJobControlNoise strips the noise that `bash -lic` emits to stderr when
+// it is interactive but has no controlling terminal, plus the "logout" line a
+// login shell prints on exit:
+//
+//	bash: cannot set terminal process group (NNNN): Inappropriate ioctl for device
+//	bash: no job control in this shell
+//	logout
+//
+// All three are exact-line artifacts of the -li flags without a PTY; they carry
+// no information and would otherwise pollute every command's output.
+func filterJobControlNoise(output string) string {
+	lines := strings.Split(output, "\n")
+	out := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, "bash: cannot set terminal process group") ||
+			strings.HasPrefix(line, "bash: no job control in this shell") ||
+			line == "logout" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 func (s *State) executeBackground(cmd *exec.Cmd, command, description string) (string, error) {

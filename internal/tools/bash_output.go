@@ -46,7 +46,8 @@ func (s *State) executeBashOutput(ctx context.Context, shellID, filter string) (
 	stdoutContent := shell.Stdout.String()
 	stderrContent := shell.Stderr.String()
 	newStdout := stdoutContent[shell.LastStdoutReadAt:]
-	newStderr := stderrContent[shell.LastStderrReadAt:]
+	// Strip the bash -lic job-control noise from stderr (same as foreground).
+	newStderr := filterJobControlNoise(stderrContent[shell.LastStderrReadAt:])
 	shell.LastStdoutReadAt = len(stdoutContent)
 	shell.LastStderrReadAt = len(stderrContent)
 

@@ -32,7 +32,8 @@ func (s *State) executeKillShell(ctx context.Context, shellID string) (string, e
 		// Guard against nil Process in edge cases where the cmd.Start() may not have completed
 		// the process initialization, though this is rare in normal operation.
 		if shell.Cmd.Process != nil {
-			if err := shell.Cmd.Process.Kill(); err != nil {
+			// Kill the entire process group (bash + grandchildren), not just bash.
+			if err := killProcessTree(shell.Cmd); err != nil {
 				return "", fmt.Errorf("Failed to kill shell %s: %s", shellID, err)
 			}
 		}
