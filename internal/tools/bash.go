@@ -79,7 +79,6 @@ func (s *State) executeBashCommand(ctx context.Context, command, description str
 		// On timeout, kill the whole process group (bash + any grandchildren),
 		// not just bash itself. Requires Setpgid (see proc_unix.go).
 		cmd.Cancel = func() error { return killProcessTree(cmd) }
-		cmd.WaitDelay = 5 * time.Second
 	}
 	setupProcessGroup(cmd)
 
@@ -93,19 +92,58 @@ func (s *State) executeBashCommand(ctx context.Context, command, description str
 	return s.executeForeground(ctx, cmd, command)
 }
 
+// ioGracePeriod is how long we keep draining stdout/stderr after the shell
+// has exited. A foreground command that spawned a background process without
+// redirecting its output keeps the pipes open (the grandchild inherited the
+// write ends), so waiting for EOF would block forever. This mirrors pi's
+// waitForChildProcess: after exit, give the pipes a short grace period and
+// return whatever output has arrived.
+const ioGracePeriod = 250 * time.Millisecond
+
 func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command string) (string, error) {
-	output, err := cmd.CombinedOutput()
-	filtered := filterJobControlNoise(string(output))
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		if strings.Contains(err.Error(), "context deadline exceeded") {
+		return "", fmt.Errorf("Failed to create stdout pipe: %s", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", fmt.Errorf("Failed to create stderr pipe: %s", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("Failed to start command: %s", err)
+	}
+
+	var outBuf, errBuf bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { _, _ = io.Copy(&outBuf, stdout); wg.Done() }()
+	go func() { _, _ = io.Copy(&errBuf, stderr); wg.Done() }()
+
+	waitErr := cmd.Wait()
+
+	// The shell has exited. Drain the pipes but bound the wait: background
+	// grandchildren that inherited the pipe write ends would otherwise keep
+	// us blocked forever (and we deliberately did NOT kill the process group
+	// here - a normally-finished command must not reap its background jobs).
+	ioDone := make(chan struct{})
+	go func() { wg.Wait(); close(ioDone) }()
+	select {
+	case <-ioDone:
+	case <-time.After(ioGracePeriod):
+	}
+
+	combined := outBuf.String() + errBuf.String()
+	filtered := filterJobControlNoise(combined)
+	if waitErr != nil {
+		if strings.Contains(waitErr.Error(), "context deadline exceeded") {
 			return "", fmt.Errorf("Command timed out. Consider increasing the timeout parameter or running in background.")
 		}
 
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			exitCode := exitErr.ExitCode()
 			// On Unix/Linux, a killed process (e.g., by timeout signal) returns exit code -1
 			// rather than the actual signal number. Detect this to provide clearer error messaging.
-			if exitCode == -1 && strings.Contains(err.Error(), "signal: killed") {
+			if exitCode == -1 && strings.Contains(waitErr.Error(), "signal: killed") {
 				return "", fmt.Errorf("Command timed out. Consider increasing the timeout parameter or running in background.")
 			}
 
@@ -117,7 +155,7 @@ func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command st
 			)
 		}
 
-		return "", fmt.Errorf("Failed to execute command: %s\n\nCommand: %s", err, command)
+		return "", fmt.Errorf("Failed to execute command: %s\n\nCommand: %s", waitErr, command)
 	}
 
 	result := filtered
