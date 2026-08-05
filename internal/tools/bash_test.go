@@ -14,7 +14,11 @@ import (
 
 func callBash(t *testing.T, state *State, input BashInput) (string, error) {
 	t.Helper()
-	return state.executeBashCommand(context.Background(), input.Command, input.Description, input.Timeout, input.RunInBackground)
+	outcome, err := state.executeBashCommand(context.Background(), input.Command, input.Description, input.Timeout, input.RunInBackground)
+	if err != nil {
+		return "", err
+	}
+	return outcome.merged, nil
 }
 
 // extractShellID parses the background shell ID from the command output.

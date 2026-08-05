@@ -43,15 +43,26 @@ type BackgroundShell struct {
 	LastStderrReadAt int
 }
 
-func (s *State) executeBashCommand(ctx context.Context, command, description string, timeout int64, runInBackground bool) (string, error) {
+// bashExecResult carries the layered outcome of a foreground command so the
+// MCP tool can return stdout / stderr / exit code separately to the agent.
+// stderr has already been stripped of the wrapper shell's own artifacts
+// (leading job-control warnings, trailing "logout").
+type bashExecResult struct {
+	stdout   string
+	stderr   string // filtered
+	exitCode int
+	merged   string // stdout + stderr, the backward-compatible combined text
+}
+
+func (s *State) executeBashCommand(ctx context.Context, command, description string, timeout int64, runInBackground bool) (*bashExecResult, error) {
 	if command == "" {
-		return "", fmt.Errorf("Command cannot be empty.")
+		return nil, fmt.Errorf("Command cannot be empty.")
 	}
 
 	timeoutMs := defaultTimeout
 	if timeout > 0 {
 		if timeout > maxTimeout {
-			return "", fmt.Errorf("Timeout cannot exceed %d milliseconds (10 minutes).", maxTimeout)
+			return nil, fmt.Errorf("Timeout cannot exceed %d milliseconds (10 minutes).", maxTimeout)
 		}
 		timeoutMs = int(timeout)
 	}
@@ -65,10 +76,10 @@ func (s *State) executeBashCommand(ctx context.Context, command, description str
 	// ~/.bashrc, so the child gets the user's FULL shell environment (PATH
 	// extensions, aliases, functions, nvm/conda/venv hooks, etc.) instead of
 	// the bare inherited env. `-c` keeps one-shot semantics with a proper exit
-	// code. Without a PTY this prints two harmless job-control warnings to
-	// stderr which we filter in executeForeground. Stdin is left nil (Go's
-	// exec treats nil Stdin as /dev/null) so the interactive shell never reads
-	// from our JSON-RPC pipe.
+	// code. Without a PTY this prints harmless job-control warnings to stderr
+	// which we filter in executeForeground. Stdin is left nil (Go's exec treats
+	// nil Stdin as /dev/null) so the interactive shell never reads from our
+	// JSON-RPC pipe.
 	var cmd *exec.Cmd
 	if runInBackground {
 		cmd = exec.Command("bash", "-lic", command)
@@ -87,7 +98,11 @@ func (s *State) executeBashCommand(ctx context.Context, command, description str
 	}
 
 	if runInBackground {
-		return s.executeBackground(cmd, command, description)
+		msg, err := s.executeBackground(cmd, command, description)
+		if err != nil {
+			return nil, err
+		}
+		return &bashExecResult{merged: msg}, nil
 	}
 	return s.executeForeground(ctx, cmd, command)
 }
@@ -100,17 +115,17 @@ func (s *State) executeBashCommand(ctx context.Context, command, description str
 // return whatever output has arrived.
 const ioGracePeriod = 250 * time.Millisecond
 
-func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command string) (string, error) {
+func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command string) (*bashExecResult, error) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", fmt.Errorf("Failed to create stdout pipe: %s", err)
+		return nil, fmt.Errorf("Failed to create stdout pipe: %s", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return "", fmt.Errorf("Failed to create stderr pipe: %s", err)
+		return nil, fmt.Errorf("Failed to create stderr pipe: %s", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("Failed to start command: %s", err)
+		return nil, fmt.Errorf("Failed to start command: %s", err)
 	}
 
 	var outBuf, errBuf bytes.Buffer
@@ -133,14 +148,19 @@ func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command st
 	}
 
 	// The job-control warnings are printed by the wrapper bash to its stderr
-	// at startup, before the command's own stderr output, so we filter the
-	// stderr stream's leading lines only and then merge. stdout is never
-	// touched.
-	combined := outBuf.String() + filterJobControlNoise(errBuf.String())
-	filtered := combined
+	// at startup, and "logout" when the command explicitly exits the login
+	// shell, so we filter the stderr stream and keep stdout untouched.
+	stdoutText := outBuf.String()
+	stderrText := filterJobControlNoise(errBuf.String())
+	outcome := &bashExecResult{
+		stdout:   stdoutText,
+		stderr:   stderrText,
+		exitCode: 0,
+		merged:   stdoutText + stderrText,
+	}
 	if waitErr != nil {
 		if strings.Contains(waitErr.Error(), "context deadline exceeded") {
-			return "", fmt.Errorf("Command timed out. Consider increasing the timeout parameter or running in background.")
+			return nil, fmt.Errorf("Command timed out. Consider increasing the timeout parameter or running in background.")
 		}
 
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
@@ -148,52 +168,70 @@ func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command st
 			// On Unix/Linux, a killed process (e.g., by timeout signal) returns exit code -1
 			// rather than the actual signal number. Detect this to provide clearer error messaging.
 			if exitCode == -1 && strings.Contains(waitErr.Error(), "signal: killed") {
-				return "", fmt.Errorf("Command timed out. Consider increasing the timeout parameter or running in background.")
+				return nil, fmt.Errorf("Command timed out. Consider increasing the timeout parameter or running in background.")
 			}
+			outcome.exitCode = exitCode
 
-			return "", fmt.Errorf(
+			return nil, fmt.Errorf(
 				"Command exited with code %d:\n%s\n\nCommand: %s",
 				exitCode,
-				filtered,
+				outcome.merged,
 				command,
 			)
 		}
 
-		return "", fmt.Errorf("Failed to execute command: %s\n\nCommand: %s", waitErr, command)
+		return nil, fmt.Errorf("Failed to execute command: %s\n\nCommand: %s", waitErr, command)
 	}
 
-	result := filtered
-	if err := checkOutputSize(ctx, result, "bash"); err != nil {
-		return "", err
+	if err := checkOutputSize(ctx, outcome.merged, "bash"); err != nil {
+		return nil, err
 	}
 
-	return result, nil
+	return outcome, nil
 }
 
-// filterJobControlNoise removes only the LEADING job-control warnings that the
-// bash -lic wrapper itself prints to stderr at startup when there is no
-// controlling terminal:
+// filterJobControlNoise cleans up the stderr stream produced by the wrapper
+// bash -lic, removing ONLY the wrapper's own artifacts and leaving the user
+// command's output untouched:
 //
-//	bash: cannot set terminal process group (NNNN): Inappropriate ioctl for device
-//	bash: no job control in this shell
-//	bash: [NNNN: 1 (255)] tcsetattr: Inappropriate ioctl for device
+//   - leading job-control warnings (bash prints them to stderr at startup
+//     when there is no controlling terminal):
+//     bash: cannot set terminal process group (NNNN): Inappropriate ioctl for device
+//     bash: no job control in this shell
+//     bash: [NNNN: 1 (255)] tcsetattr: Inappropriate ioctl for device
+//   - a trailing "logout" line (a login shell prints it when the command
+//     explicitly runs `exit`; at the very end of the stderr stream it can
+//     only come from the wrapper shell itself - a nested `bash -lic` would
+//     need to both exit itself AND leave its stderr unredirected to land
+//     here, and manual `echo logout >&2` without an outer `exit` is equally
+//     contrived, so this filter cannot realistically mis-strip real output).
 //
-// It is applied to the stderr stream only, BEFORE merging with stdout, so the
-// user command's own output is never touched: a nested `bash -lic` inside the
-// command, `echo logout`, or any real stderr line after the warnings all stay
-// intact. The "logout" line a login shell prints on explicit `exit` is
-// intentionally NOT filtered: it is rare (only when the command itself runs
-// exit) and self-explanatory.
+// Anything in between - a nested `bash -lic` with redirected stderr, `echo
+// logout` on stdout, real diagnostics - is preserved.
 func filterJobControlNoise(output string) string {
 	lines := strings.Split(output, "\n")
+
+	// Leading wrapper warnings.
 	i := 0
 	for i < len(lines) && isJobControlNoise(lines[i]) {
 		i++
 	}
-	if i == 0 {
+
+	// Trailing "logout" from an explicit exit of the wrapper login shell.
+	// strings.Split yields a final "" for a trailing newline; skip it, then
+	// drop a single exact "logout" line.
+	j := len(lines)
+	if j > i && lines[j-1] == "" {
+		j--
+	}
+	if j > i && lines[j-1] == "logout" {
+		j--
+	}
+
+	if i == 0 && j == len(lines) {
 		return output
 	}
-	return strings.Join(lines[i:], "\n")
+	return strings.Join(lines[i:j], "\n")
 }
 
 func isJobControlNoise(line string) bool {
@@ -284,19 +322,27 @@ type BashInput struct {
 }
 
 type BashResult struct {
-	Result string `json:"result"`
+	Result   string `json:"result"`           // combined stdout + stderr (backward compatible)
+	Stdout   string `json:"stdout,omitempty"` // layered: raw stdout, never filtered
+	Stderr   string `json:"stderr,omitempty"` // layered: stderr with wrapper artifacts removed
+	ExitCode int    `json:"exit_code"`        // exit code (0 on success)
 }
 
 func Bash(ctx context.Context, req *sdk.CallToolRequest, args BashInput) (*sdk.CallToolResult, any, error) {
 	server := GetState()
-	result, err := server.executeBashCommand(ctx, args.Command, args.Description, args.Timeout, args.RunInBackground)
+	outcome, err := server.executeBashCommand(ctx, args.Command, args.Description, args.Timeout, args.RunInBackground)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	output := &BashResult{Result: result}
+	output := &BashResult{
+		Result:   outcome.merged,
+		Stdout:   outcome.stdout,
+		Stderr:   outcome.stderr,
+		ExitCode: outcome.exitCode,
+	}
 	return &sdk.CallToolResult{
-		Content:           []sdk.Content{&sdk.TextContent{Text: result}},
+		Content:           []sdk.Content{&sdk.TextContent{Text: outcome.merged}},
 		StructuredContent: output,
 	}, output, nil
 }
