@@ -132,8 +132,12 @@ func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command st
 	case <-time.After(ioGracePeriod):
 	}
 
-	combined := outBuf.String() + errBuf.String()
-	filtered := filterJobControlNoise(combined)
+	// The job-control warnings are printed by the wrapper bash to its stderr
+	// at startup, before the command's own stderr output, so we filter the
+	// stderr stream's leading lines only and then merge. stdout is never
+	// touched.
+	combined := outBuf.String() + filterJobControlNoise(errBuf.String())
+	filtered := combined
 	if waitErr != nil {
 		if strings.Contains(waitErr.Error(), "context deadline exceeded") {
 			return "", fmt.Errorf("Command timed out. Consider increasing the timeout parameter or running in background.")
@@ -166,52 +170,30 @@ func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command st
 	return result, nil
 }
 
-// filterJobControlNoise strips only the EDGE job-control warnings that the
-// bash -lic wrapper itself emits when there is no controlling terminal:
+// filterJobControlNoise removes only the LEADING job-control warnings that the
+// bash -lic wrapper itself prints to stderr at startup when there is no
+// controlling terminal:
 //
 //	bash: cannot set terminal process group (NNNN): Inappropriate ioctl for device
 //	bash: no job control in this shell
 //	bash: [NNNN: 1 (255)] tcsetattr: Inappropriate ioctl for device
 //
-// These are produced by the wrapper shell itself, not by the user command, and
-// they are confined to the edges of the output: on startup (bash tries to grab
-// the terminal and fails) and/or on exit (with Setpgid the startup attempt
-// succeeds and the warning moves to shutdown, printed to stderr after the
-// command's own output). We therefore remove ONLY consecutive matching lines
-// at the very start and at the very end of the output. Anything in the middle
-// - a nested `bash -lic` inside the command, `echo logout`, or any other real
-// output - is the user command's own and is preserved. The "logout" line a
-// login shell prints on explicit `exit` is intentionally NOT filtered: it is
-// rare (only when the command itself runs exit) and self-explanatory.
+// It is applied to the stderr stream only, BEFORE merging with stdout, so the
+// user command's own output is never touched: a nested `bash -lic` inside the
+// command, `echo logout`, or any real stderr line after the warnings all stay
+// intact. The "logout" line a login shell prints on explicit `exit` is
+// intentionally NOT filtered: it is rare (only when the command itself runs
+// exit) and self-explanatory.
 func filterJobControlNoise(output string) string {
 	lines := strings.Split(output, "\n")
-
-	// Leading noise.
 	i := 0
 	for i < len(lines) && isJobControlNoise(lines[i]) {
 		i++
 	}
-	if i == len(lines) {
-		// Everything was leading noise; keep nothing (drop even the empty
-		// trailing element from Split).
-		return ""
+	if i == 0 {
+		return output
 	}
-	body := strings.Join(lines[i:], "\n")
-
-	// Trailing noise. strings.Split always yields a final "" for a trailing
-	// newline, so trim it before scanning backwards, then restore one.
-	hadTrailingNL := strings.HasSuffix(body, "\n")
-	trimmed := strings.TrimRight(body, "\n")
-	tlines := strings.Split(trimmed, "\n")
-	j := len(tlines)
-	for j > 0 && isJobControlNoise(tlines[j-1]) {
-		j--
-	}
-	rest := strings.Join(tlines[:j], "\n")
-	if hadTrailingNL && rest != "" {
-		rest += "\n"
-	}
-	return rest
+	return strings.Join(lines[i:], "\n")
 }
 
 func isJobControlNoise(line string) bool {
