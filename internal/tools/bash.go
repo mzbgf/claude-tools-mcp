@@ -166,28 +166,58 @@ func (s *State) executeForeground(ctx context.Context, cmd *exec.Cmd, command st
 	return result, nil
 }
 
-// filterJobControlNoise strips the noise that `bash -lic` emits to stderr when
-// it is interactive but has no controlling terminal, plus the "logout" line a
-// login shell prints on exit:
+// filterJobControlNoise strips only the EDGE job-control warnings that the
+// bash -lic wrapper itself emits when there is no controlling terminal:
 //
 //	bash: cannot set terminal process group (NNNN): Inappropriate ioctl for device
 //	bash: no job control in this shell
-//	logout
+//	bash: [NNNN: 1 (255)] tcsetattr: Inappropriate ioctl for device
 //
-// All three are exact-line artifacts of the -li flags without a PTY; they carry
-// no information and would otherwise pollute every command's output.
+// These are produced by the wrapper shell itself, not by the user command, and
+// they are confined to the edges of the output: on startup (bash tries to grab
+// the terminal and fails) and/or on exit (with Setpgid the startup attempt
+// succeeds and the warning moves to shutdown, printed to stderr after the
+// command's own output). We therefore remove ONLY consecutive matching lines
+// at the very start and at the very end of the output. Anything in the middle
+// - a nested `bash -lic` inside the command, `echo logout`, or any other real
+// output - is the user command's own and is preserved. The "logout" line a
+// login shell prints on explicit `exit` is intentionally NOT filtered: it is
+// rare (only when the command itself runs exit) and self-explanatory.
 func filterJobControlNoise(output string) string {
 	lines := strings.Split(output, "\n")
-	out := lines[:0]
-	for _, line := range lines {
-		if strings.HasPrefix(line, "bash: cannot set terminal process group") ||
-			strings.HasPrefix(line, "bash: no job control in this shell") ||
-			line == "logout" {
-			continue
-		}
-		out = append(out, line)
+
+	// Leading noise.
+	i := 0
+	for i < len(lines) && isJobControlNoise(lines[i]) {
+		i++
 	}
-	return strings.Join(out, "\n")
+	if i == len(lines) {
+		// Everything was leading noise; keep nothing (drop even the empty
+		// trailing element from Split).
+		return ""
+	}
+	body := strings.Join(lines[i:], "\n")
+
+	// Trailing noise. strings.Split always yields a final "" for a trailing
+	// newline, so trim it before scanning backwards, then restore one.
+	hadTrailingNL := strings.HasSuffix(body, "\n")
+	trimmed := strings.TrimRight(body, "\n")
+	tlines := strings.Split(trimmed, "\n")
+	j := len(tlines)
+	for j > 0 && isJobControlNoise(tlines[j-1]) {
+		j--
+	}
+	rest := strings.Join(tlines[:j], "\n")
+	if hadTrailingNL && rest != "" {
+		rest += "\n"
+	}
+	return rest
+}
+
+func isJobControlNoise(line string) bool {
+	return strings.HasPrefix(line, "bash: cannot set terminal process group") ||
+		strings.HasPrefix(line, "bash: no job control in this shell") ||
+		strings.Contains(line, "tcsetattr: Inappropriate ioctl for device")
 }
 
 func (s *State) executeBackground(cmd *exec.Cmd, command, description string) (string, error) {
